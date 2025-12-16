@@ -1,1 +1,603 @@
+///////////////////////////////////////////////////////////////////////////////////////////  一、定义监测区域和时间 
+var xmin = 105.17566195862813;
+var ymin = 18.39809991439501;
+var xmax = 105.88702670472188;
+var ymax = 19.31041092185688;
+
+var roi = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax]);
+Map.centerObject(roi, 10);
+
+
+
+
+//----------- (3)调取Sentienl-1数据
+// 洪水前后时间范围（用于“候选影像”的检索与可视化）
+var after_start  = '2025-09-29';
+var after_end    = '2025-10-05';
+var before_start = '2025-09-18'
+var before_end   = '2025-09-28';
+
+// 极化方式和分辨率要求
+var polarization   = 'VH';
+var resolution     = 10;
+var pass_direction = 'DESCENDING';
+
+function fullyCoversROI(image) {
+  var footprint = ee.Geometry(image.geometry());
+  var covers = footprint.contains(roi, ee.ErrorMargin(1));
+  return image.set('coversROI', covers);
+}
+
+// 洪水前（候选）
+var beforeVis = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(before_start, before_end)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', polarization))
+  .filter(ee.Filter.eq('resolution_meters', resolution))
+  .filter(ee.Filter.eq('orbitProperties_pass', pass_direction))
+  .select(['VH'])
+  .map(fullyCoversROI);
+
+// 洪水后（候选）
+var afterVis = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(after_start, after_end)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', polarization))
+  .filter(ee.Filter.eq('resolution_meters', resolution))
+  .filter(ee.Filter.eq('orbitProperties_pass', pass_direction))
+  .select(['VH'])
+  .map(fullyCoversROI);
+
+// ===== 可视化候选影像（用于人工挑片；这些图层不参与后续计算） =====
+var afterImages = afterVis.toList(afterVis.size());
+for (var i = 0; i < afterVis.size().getInfo(); i++) {
+  var imgA = ee.Image(afterImages.get(i));
+  var dateA = ee.Date(imgA.get('system:time_start')).format('YYYY-MM-dd').getInfo();
+  Map.addLayer(imgA.clip(roi), {min: -25, max: 0}, dateA + ' After', 0);
+}
+
+var beforeImages = beforeVis.toList(beforeVis.size());
+for (var j = 0; j < beforeVis.size().getInfo(); j++) {
+  var imgB = ee.Image(beforeImages.get(j));
+  var dateB = ee.Date(imgB.get('system:time_start')).format('YYYY-MM-dd').getInfo();
+  Map.addLayer(imgB.clip(roi), {min: -25, max: 0}, dateB + ' Before', 0);
+}
+
+
+// 指定要参与计算的日期：
+var selectedAfterDate   = '2025-10-01';                 // After：洪水后影像序列中影像选取时间
+var selectedBeforeDates = ['2025-09-19', '2025-09-25']; // Before：洪水前影像序列中影像选取时间
+
+
+function pickMosaicByDate(col, dateStr) {
+  var start = ee.Date(dateStr);
+  var end   = start.advance(1, 'day');
+  var dayCol = col.filterDate(start, end);
+  var mosaicked = dayCol.sort('system:time_start').mosaic();
+  return mosaicked.set('manual_date', dateStr);
+}
+
+
+// After
+var afterCollection = ee.ImageCollection([
+  pickMosaicByDate(afterVis, selectedAfterDate).select(['VH']).clip(roi)
+]);
+
+// Before
+var beforeCollection = ee.ImageCollection(selectedBeforeDates.map(function(d) {
+  return pickMosaicByDate(beforeVis, d).select(['VH']).clip(roi);
+}));
+
+var afterImgForCalc = ee.Image(afterCollection.first());
+Map.addLayer(afterImgForCalc, {min: -25, max: 0}, 'Manual_' + selectedAfterDate + '_After', true, 0);
+
+selectedBeforeDates.forEach(function(d) {
+  var img = pickMosaicByDate(beforeVis, d).select(['VH']).clip(roi);
+  Map.addLayer(img, {min: -25, max: 0}, 'Manual_' + d + '_Before', true, 0);
+});
+
+
+
+
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////  二、计算SDWI
+
+var postFloodImage = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate('2025-09-29', '2025-10-02')  // 精确指定日期
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('resolution_meters', resolution))
+  .filter(ee.Filter.eq('orbitProperties_pass', pass_direction))
+  .select(['VV', 'VH'])
+  .map(fullyCoversROI)
+  .sort('system:time_start')  
+  .mosaic()                   
+  .clip(roi);
+
+
+
+var VV = postFloodImage.select('VV');
+var VH = postFloodImage.select('VH');
+
+// 50 m 平滑）
+var VV_smooth = VV.focal_mean({radius: 50, units: 'meters', kernelType: 'circle'});
+var VH_smooth = VH.focal_mean({radius: 50, units: 'meters', kernelType: 'circle'});
+
+var SDWI = postFloodImage.expression(
+  'log(10 * VV * VH) - 8',
+  {
+    'VV': VV_smooth,
+    'VH': VH_smooth
+  }
+).rename('SDWI').clip(roi);
+
+Map.addLayer(SDWI, {min: -10, max: 0, palette: ['blue', 'white', 'green']}, 'SDWI',0);
+
+// 计算 SDWI 直方图
+var histogram = SDWI.reduceRegion({
+  reducer: ee.Reducer.histogram(1000, 0.01),
+  geometry: roi,
+  scale: 10,
+  bestEffort: true
+}).get('SDWI');
+
+// 可视化 SDWI 直方图
+var chart = ui.Chart.image.histogram({
+  image: SDWI,
+  region: roi,
+  scale: 10,
+  maxBuckets: 1000,
+  minBucketWidth: 0.01,
+  maxPixels: 1e9
+}).setOptions({
+  title: 'SDWI Histogram',
+  hAxis: {title: 'SDWI Value'},
+  vAxis: {title: 'Frequency'},
+});
+print(chart);
+
+// OTSU 阈值计算函数
+var otsu = function(histogram) {
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum1 = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  
+  var sumB = ee.Number(0);
+  var wB = ee.Number(0);
+  var maximum = ee.Number(0);
+  var threshold = ee.Number(0);
+  
+  for (var i = 0; i < means.length().get([0]); i++) {
+    wB = wB.add(counts.get([i]));
+    var wF = total.subtract(wB);
+    if (wB.eq(0).or(wF.eq(0)).getInfo()) continue;
+    
+    sumB = sumB.add(means.get([i]).multiply(counts.get([i])));
+    var mB = sumB.divide(wB);
+    var mF = (sum1.subtract(sumB)).divide(wF);
+    
+    var between = wB.multiply(wF).multiply(mB.subtract(mF).pow(2));
+    if (between.gt(maximum)) {
+      maximum = between;
+      threshold = means.get([i]);
+    }
+  }
+  return threshold;
+};
+
+// 计算 OTSU 阈值
+var threshold = otsu(histogram);
+print('OTSU Threshold:', threshold);
+
+// 水体掩膜
+var waterMask = SDWI.gt(ee.Number(threshold)).selfMask();
+Map.addLayer(waterMask, {palette: ['yellow']}, 'Water Mask', 0);
+
+// 后处理
+// 1剔除永久水体
+var worldcover = ee.Image('ESA/WorldCover/v200/2021').clip(roi);
+var permanentWaterMask = worldcover.eq(80); 
+var water_noPermanent = waterMask.where(permanentWaterMask, 0).selfMask();
+// 2连通性分析
+var water_connected = water_noPermanent.connectedPixelCount(15, true).gte(15);
+var water_connectedMask = water_noPermanent.updateMask(water_connected).rename('water_connectedMask');
+// 3山体阴影剔除
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(roi);
+var slope_srtm = ee.Terrain.slope(srtm);
+
+var shadowMask_5deg = slope_srtm.gt(5).and(water_connectedMask.eq(1));
+var auxiliaryReference = water_connectedMask.where(shadowMask_5deg, 0).rename('auxiliaryReference');
+
+// 可视化辅助参考图层
+Map.addLayer(auxiliaryReference, {palette: ['Blue']}, 'auxiliaryReference');
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////// 三 、NDFI 计算+阈值敏感性分析
+
+// 1. NDFI 计算
+var beforeSmoothed = beforeCollection.map(function (image) {
+  return image.focal_mean({radius: 50, units: 'meters', kernelType: 'circle'});
+});
+
+var afterSmoothed = afterCollection.map(function (image) {
+  return image.focal_mean({radius: 50, units: 'meters', kernelType: 'circle'});
+});
+
+var mean_before = beforeSmoothed.mean().clip(roi);
+var min_after   = afterSmoothed.min().clip(roi);
+
+Map.addLayer(mean_before, {min: -29.26, max: -8.93}, 'Mean Before', 0);
+Map.addLayer(min_after,   {min: -29.29, max: -11.93}, 'Min After', 0);
+
+var ndfi = mean_before.abs().subtract(min_after.abs())
+  .divide(mean_before.abs().add(min_after.abs()))
+  .rename('NDFI');
+
+Map.addLayer(ndfi, {min: 0, max: 1}, 'Flood Extraction Layer', 0);
+
+// 2. 阈值敏感性分析
+var stats = ndfi.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  }),
+  geometry: roi,
+  scale: resolution,
+  maxPixels: 1e13
+});
+
+var mean = ee.Number(stats.get('NDFI_mean'));
+var std  = ee.Number(stats.get('NDFI_stdDev'));
+
+var SDWI_01   = auxiliaryReference.gt(0).unmask(0);
+var slopeMask = slope_srtm.gt(5);
+var pixelArea = ee.Image.pixelArea();
+
+// Kf 扫描序列
+var kfList  = ee.List.sequence(0.5, 2.5, 0.1);
+var nKf     = kfList.length();
+var idxList = ee.List.sequence(0, nKf.subtract(1));
+
+var interUnionCol = ee.ImageCollection(kfList.map(function (kf) {
+  kf = ee.Number(kf);
+
+  var threshold    = mean.subtract(kf.multiply(std));
+  var flooded_ndfi = ndfi.lt(threshold);
+
+  var NDFI_shadowRemoved = flooded_ndfi.where(slopeMask.and(flooded_ndfi), 0);
+  var connections        = NDFI_shadowRemoved.connectedPixelCount(15, true).gte(15);
+  var NDFI_floodOnly     = NDFI_shadowRemoved
+    .updateMask(connections)
+    .updateMask(permanentWaterMask.not());
+
+  var NDFI_01 = NDFI_floodOnly.unmask(0);
+
+  var intersection = SDWI_01.and(NDFI_01); 
+  var union        = SDWI_01.or(NDFI_01); 
+
+  return intersection.rename('inter')
+    .addBands(union.rename('union'))
+    .float();
+}));
+
+// 把所有 Kf 的 inter/union 压成一张多波段图，一次性求面积
+var interUnionImg = interUnionCol.toBands().multiply(pixelArea);
+var bandNames     = interUnionImg.bandNames();
+
+var areaDict = interUnionImg.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: resolution,
+  maxPixels: 1e13
+});
+
+var resultList = idxList.map(function (i) {
+  i = ee.Number(i).toInt();
+
+  var kf        = ee.Number(kfList.get(i));
+  var threshold = mean.subtract(kf.multiply(std));
+
+  var interBand = ee.String(bandNames.get(i.multiply(2)));
+  var unionBand = ee.String(bandNames.get(i.multiply(2).add(1)));
+
+  var interArea = ee.Number(areaDict.get(interBand));
+  var unionArea = ee.Number(areaDict.get(unionBand));
+
+  var agreement = ee.Algorithms.If(
+    unionArea.gt(0),
+    interArea.divide(unionArea).multiply(100),
+    0
+  );
+
+  return ee.Feature(null, {
+    'Kf'       : kf,
+    'Threshold': threshold,
+    'Agreement': agreement,
+    'InterArea': interArea,
+    'UnionArea': unionArea
+  });
+});
+
+var resultFC = ee.FeatureCollection(resultList);
+// print('每轮敏感性分析结果详情：', resultFC);
+
+var chart = ui.Chart.feature.byFeature(resultFC, 'Kf', ['Agreement'])
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'NDFI vs SDWI 洪水一致性敏感性分析（基于原始 NDFI）',
+    hAxis: {title: 'Kf 阈值系数'},
+    vAxis: {title: 'Total Agreement (%)'},
+    pointSize: 4,
+    lineWidth: 2
+  });
+print(chart);
+
+// 获取最佳阈值
+var best          = resultFC.sort('Agreement', false).first();
+var best_kf       = ee.Number(best.get('Kf'));
+var best_threshold = ee.Number(best.get('Threshold'));
+print('最佳 Kf:', best_kf);
+
+// 用最佳阈值生成最终掩膜
+var flooded_ndfi_best        = ndfi.lt(best_threshold).rename('flooded_ndfi_best');
+var shadowMask_best          = slope_srtm.gt(5).and(flooded_ndfi_best.eq(1));
+var NDFI_shadowRemoved_best  = flooded_ndfi_best.where(shadowMask_best, 0).rename('NDFI_shadowRemoved_best');
+var connections_best         = NDFI_shadowRemoved_best.connectedPixelCount(15, true).gte(15);
+var NDFI_connected_best      = NDFI_shadowRemoved_best.updateMask(connections_best).eq(1).rename('NDFI_connected_best');
+var final_best_mask          = NDFI_connected_best.updateMask(permanentWaterMask.not()).selfMask().rename('mask');
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////// 四 、NDFVI 计算
+// mean（reference）
+var beforeCollectionNDFVI = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(before_start, before_end)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', polarization))
+  .filter(ee.Filter.eq('orbitProperties_pass', pass_direction))
+  .select([polarization]);
+
+var mean_before_ndfvi = beforeCollectionNDFVI.mean().clip(roi);
+
+// max（flood）
+var afterCollectionNDFVI = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(after_start, after_end)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', polarization))
+  .filter(ee.Filter.eq('orbitProperties_pass', pass_direction))
+  .select([polarization]);
+
+var max_after_ndfvi = afterCollectionNDFVI.max().clip(roi);
+
+Map.addLayer(max_after_ndfvi, {min: -25, max: 0}, 'Max SAR Flood Image (NDFVI)', 0);
+
+// NDFVI 指数
+var ndfvi = max_after_ndfvi.subtract(mean_before_ndfvi)
+  .divide(max_after_ndfvi.add(mean_before_ndfvi))
+  .rename('NDFVI');
+
+// 平滑（与前文保持一致）
+var ndfvi_filtered = ndfvi.focal_mean({
+  radius: 50, kernelType: 'circle', units: 'meters'
+});
+
+var stats_ndfvi = ndfvi_filtered.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  }),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13
+});
+var mean_ndfvi = ee.Number(stats_ndfvi.get('NDFVI_mean'));
+var std_ndfvi  = ee.Number(stats_ndfvi.get('NDFVI_stdDev'));
+
+var threshold_ndfvi = mean_ndfvi.add(best_kf.multiply(std_ndfvi));
+var flooded_ndfvi = ndfvi_filtered.gt(threshold_ndfvi).selfMask().rename('NDFVI_FloodMask');
+
+// 后处理（与 NDFI 一致的坡度/连通性/永久水体剔除）
+var shadowMask_ndfvi = slope_srtm.gt(5).and(flooded_ndfvi.eq(1));
+var NDFVI_shadowRemoved = flooded_ndfvi.where(shadowMask_ndfvi, 0).rename('NDFVI_shadowRemoved');
+var connections_ndfvi = NDFVI_shadowRemoved.connectedPixelCount(15, true).gte(15);
+var NDFVI_connected = NDFVI_shadowRemoved.updateMask(connections_ndfvi).eq(1).rename('NDFVI_connected');
+var NDFVI_floodOnly = NDFVI_connected.updateMask(permanentWaterMask.not())
+  .selfMask()
+  .rename('NDFVI_floodOnly');
+
+Map.addLayer(NDFVI_floodOnly, {palette: ['#00ff00']}, 'NDFVI (Best Kf)', 0);
+Map.addLayer(final_best_mask, {palette: ['yellow']}, 'best NDFI', 0);
+
+// 最终洪水范围（NDFI ∪ NDFVI）
+var ndfi_mask  = final_best_mask.unmask(0).rename('NDFI_mask');
+var ndfvi_mask = NDFVI_floodOnly.unmask(0).rename('NDFVI_mask');
+var ndfvi_only_extra = ndfvi_mask.and(ndfi_mask.not());
+var flood_area = ndfi_mask.or(ndfvi_only_extra).rename('Flood Area');
+var flood_area_vis = flood_area.selfMask();
+Map.addLayer(flood_area_vis, {palette: ['red']}, 'Flood Area', 0);
+
+
+
+
+
+
+
+//////////////////////////////////////////////////////////////////// 五、土地类别淹没分析（基于 ESA WorldCover 2021）
+
+// 1) 洪水掩膜二值化（Flood_Area）
+var floodMaskBinary = flood_area.unmask(0).gt(0);  // 与红色 Flood Area 图层对应
+
+// 2) 读取 WorldCover 2021，并仅在洪水范围内保留土地利用
+var worldcover = ee.Image('ESA/WorldCover/v200/2021')
+  .select('Map')
+  .clip(roi);
+
+// WorldCover 原始类别编码及名称（官方 10 类 + 2 类）
+var WC_CODES = [
+  10,  // Tree cover
+  20,  // Shrubland
+  30,  // Grassland
+  40,  // Cropland
+  50,  // Built-up
+  60,  // Bare / sparse
+  70,  // Snow and ice
+  80,  // Permanent water bodies
+  90,  // Herbaceous wetland
+  95,  // Mangroves
+  100  // Moss & lichen
+];
+
+var CLASS_NAMES = [
+  'Tree cover',
+  'Shrubland',
+  'Grassland',
+  'Cropland',
+  'Built-up',
+  'Bare / sparse',
+  'Snow and ice',
+  'Permanent water',
+  'Herbaceous wetland',
+  'Mangroves',
+  'Moss & lichen'
+];
+
+var VIS_PALETTE = [
+  '006400', // 10 Tree cover
+  'ffbb22', // 20 Shrubland
+  'ffff4c', // 30 Grassland
+  'f096ff', // 40 Cropland
+  'fa0000', // 50 Built-up
+  'b4b4b4', // 60 Bare / sparse
+  'f0f0f0', // 70 Snow and ice
+  '0064c8', // 80 Permanent water
+  '0096a0', // 90 Herbaceous wetland
+  '00cf75', // 95 Mangroves
+  'fae6a0'  // 100 Moss & lichen
+];
+
+// 为了方便可视化和统计，将 WorldCover 重分类到 0..N-1
+var lcReclass = worldcover.remap(
+  WC_CODES,
+  ee.List.sequence(0, WC_CODES.length - 1),
+  255  // 其他类别映射为 255，后续会被掩膜掉
+).rename('lc');
+
+// 洪水范围内的土地利用
+var floodedLc = lcReclass.updateMask(floodMaskBinary);
+
+// 3) 可视化淹没土地类型（WorldCover 风格）
+Map.addLayer(
+  floodedLc,
+  {min: 0, max: WC_CODES.length - 1, palette: VIS_PALETTE},
+  'Flooded LandCover (WorldCover 2021)',
+  true
+);
+
+// 4) 图例
+function addLegend(panelTitle, labels, colors) {
+  var legend = ui.Panel({
+    style: {position: 'bottom-left', padding: '8px 15px'}
+  });
+  legend.add(ui.Label({
+    value: panelTitle,
+    style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0'}
+  }));
+  labels.forEach(function (label, i) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: colors[i],
+        padding: '8px',
+        margin: '0 0 4px 0'
+      }
+    });
+    var description = ui.Label(label, {margin: '0 0 4px 6px'});
+    var row = ui.Panel([colorBox, description],
+      ui.Panel.Layout.Flow('horizontal'));
+    legend.add(row);
+  });
+  Map.add(legend);
+}
+
+addLegend('淹没土地类型 (WorldCover 2021, NDFI ∪ NDFVI)', CLASS_NAMES, VIS_PALETTE);
+
+// 5) 面积统计（单位：平方千米）
+//    - floodedLc：重分类后的土地利用（0..N-1）
+//    - floodMaskBinary：洪水掩膜
+var lcStats = floodedLc.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+
+var floodAreaStats = floodMaskBinary.rename('flood').reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  bestEffort: true
+});
+
+// 输出
+lcStats.evaluate(function (result) {
+  floodAreaStats.evaluate(function (fa) {
+
+    var floodPixels = (fa && fa.flood) ? fa.flood : 0;
+    var floodKm2    = floodPixels * 100 / 1e6;  // 10m 像元面积 = 100 m²
+
+    if (!result || Object.keys(result).length === 0 || !result.lc) {
+      print('【WorldCover 洪水掩膜下无土地利用数据】');
+      print('合并洪水总面积（NDFI ∪ NDFVI）：' +
+            floodKm2.toFixed(2) + ' 平方千米');
+      return;
+    }
+
+    print('===== WorldCover 2021 洪水淹没面积分析 ====');
+
+    var histogram = result.lc;  // 各重分类值（0..N-1）的像元个数
+    var totalArea = 0;
+
+    Object.keys(histogram)
+      .sort(function (a, b) { return Number(a) - Number(b); })
+      .forEach(function (key) {
+        var idx      = Number(key);             // 重分类索引 0..N-1
+        var count    = histogram[key];
+        var areaKm2  = count * 100 / 1e6;
+        totalArea   += areaKm2;
+
+        var code     = WC_CODES[idx];           // 原始 WorldCover 类别编码（10,20,...）
+        var catName  = CLASS_NAMES[idx] || 'Unknown';
+
+        print('类别 ' + code + ' - ' + catName + '：' +
+              areaKm2.toFixed(2) + ' 平方千米');
+      });
+
+    print('—— 合计（按 WorldCover 类别汇总）：' +
+          totalArea.toFixed(2) + ' 平方千米');
+    print('—— 合并洪水总面积（掩膜像元计数）：' +
+          floodKm2.toFixed(2) + ' 平方千米');
+  });
+});
+
+
+
 
